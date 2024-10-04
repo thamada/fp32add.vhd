@@ -1,81 +1,233 @@
 library IEEE;
 use IEEE.STD_LOGIC_1164.ALL;
-use IEEE.NUMERIC_STD.ALL;
 
 entity FPAdder is
     Port (
-        a       : in  std_logic_vector(31 downto 0); -- 32ビット入力 a
-        b       : in  std_logic_vector(31 downto 0); -- 32ビット入力 b
-        result  : out std_logic_vector(31 downto 0)  -- 32ビット結果
+        clk : in std_logic;
+        a   : in std_logic_vector(31 downto 0);
+        b   : in std_logic_vector(31 downto 0);
+        sum : out std_logic_vector(31 downto 0)
     );
 end FPAdder;
 
 architecture Behavioral of FPAdder is
-    -- 符号、指数、仮数のビット数
-    constant EXP_WIDTH : integer := 8;
-    constant FRAC_WIDTH : integer := 23;
-    constant BIAS : integer := 127;
 
-    -- 信号の宣言
-    signal sign_a, sign_b, sign_res : std_logic;
-    signal exp_a, exp_b, exp_res : integer;
-    signal frac_a, frac_b, frac_res : std_logic_vector(FRAC_WIDTH downto 0); -- 1+23ビット（隠れビット含む）
+    -- パイプラインステージ間の信号を宣言
+    -- ステージ1からステージ2への信号
+    signal s1_a_sign        : std_logic;
+    signal s1_a_exp         : std_logic_vector(7 downto 0);
+    signal s1_a_frac        : std_logic_vector(23 downto 0);
+    signal s1_b_sign        : std_logic;
+    signal s1_b_exp         : std_logic_vector(7 downto 0);
+    signal s1_b_frac        : std_logic_vector(23 downto 0);
 
-    signal aligned_frac_a, aligned_frac_b : std_logic_vector(FRAC_WIDTH + 1 downto 0); -- アラインメント後
-    signal sum_frac : std_logic_vector(FRAC_WIDTH + 2 downto 0); -- 和の結果 (ゲートレベルの桁上がり処理用)
-    signal shift_amount : integer;
+    -- ステージ2からステージ3への信号
+    signal s2_sign_result   : std_logic;
+    signal s2_exp_result    : std_logic_vector(7 downto 0);
+    signal s2_mantissa_sum  : std_logic_vector(24 downto 0);
+
+    -- 正規化後の結果
+    signal normalized_sign  : std_logic;
+    signal normalized_exp   : std_logic_vector(7 downto 0);
+    signal normalized_frac  : std_logic_vector(22 downto 0);
+
+    -- ビットごとの演算で使用する関数を宣言
+    function compare_vectors(a, b : std_logic_vector) return integer;
+    function add_vectors(a, b : std_logic_vector) return std_logic_vector;
+    function subtract_vectors(a, b : std_logic_vector) return std_logic_vector;
+    function shift_right(v : std_logic_vector; n : integer) return std_logic_vector;
 
 begin
-    process(a, b)
+
+    -- ビットごとの比較関数
+    function compare_vectors(a, b : std_logic_vector) return integer is
+        variable result : integer := 0;
     begin
-        -- 1. 入力分解
-        sign_a <= a(31);
-        sign_b <= b(31);
-        exp_a <= to_integer(unsigned(a(30 downto 23))) - BIAS;
-        exp_b <= to_integer(unsigned(b(30 downto 23))) - BIAS;
-        frac_a <= "1" & a(22 downto 0); -- 隠れビットを追加
-        frac_b <= "1" & b(22 downto 0); -- 隠れビットを追加
+        for i in a'range loop
+            if a(i) = '1' and b(i) = '0' then
+                result := 1;
+                return result;
+            elsif a(i) = '0' and b(i) = '1' then
+                result := -1;
+                return result;
+            end if;
+        end loop;
+        return result; -- 0の場合は等しい
+    end function;
 
-        -- 2. 指数アラインメント
-        if exp_a > exp_b then
-            shift_amount := exp_a - exp_b;
-            exp_res := exp_a;
-            aligned_frac_a <= frac_a & '0';
-            aligned_frac_b <= std_logic_vector(shift_right(unsigned(frac_b & '0'), shift_amount));
-        else
-            shift_amount := exp_b - exp_a;
-            exp_res := exp_b;
-            aligned_frac_a <= std_logic_vector(shift_right(unsigned(frac_a & '0'), shift_amount));
-            aligned_frac_b <= frac_b & '0';
+    -- ビットごとの加算関数
+    function add_vectors(a, b : std_logic_vector) return std_logic_vector is
+        variable sum    : std_logic_vector(a'range);
+        variable carry  : std_logic := '0';
+        variable temp   : std_logic;
+    begin
+        for i in a'reverse_range loop
+            temp := a(i) xor b(i) xor carry;
+            carry := (a(i) and b(i)) or (a(i) and carry) or (b(i) and carry);
+            sum(i) := temp;
+        end loop;
+        return sum;
+    end function;
+
+    -- ビットごとの減算関数
+    function subtract_vectors(a, b : std_logic_vector) return std_logic_vector is
+        variable diff   : std_logic_vector(a'range);
+        variable borrow : std_logic := '0';
+        variable temp   : std_logic;
+    begin
+        for i in a'reverse_range loop
+            temp := a(i) xor b(i) xor borrow;
+            borrow := (not a(i) and b(i)) or ((not a(i) or b(i)) and borrow);
+            diff(i) := temp;
+        end loop;
+        return diff;
+    end function;
+
+    -- ビットごとの右シフト関数
+    function shift_right(v : std_logic_vector; n : integer) return std_logic_vector is
+        variable shifted : std_logic_vector(v'range) := v;
+    begin
+        for i in 1 to n loop
+            shifted := '0' & shifted(shifted'high downto 1);
+        end loop;
+        return shifted;
+    end function;
+
+    -- ステージ1 組み合わせ回路：オペランドの分解と整列
+    -- オペランドaの分解
+    s1_a_sign_comb : s1_a_sign <= a(31);
+    s1_a_exp_comb  : s1_a_exp  <= a(30 downto 23);
+    s1_a_frac_comb : s1_a_frac <= '1' & a(22 downto 0); -- 仮数部に隠れた1を追加
+
+    -- オペランドbの分解
+    s1_b_sign_comb : s1_b_sign <= b(31);
+    s1_b_exp_comb  : s1_b_exp  <= b(30 downto 23);
+    s1_b_frac_comb : s1_b_frac <= '1' & b(22 downto 0); -- 仮数部に隠れた1を追加
+
+    -- ステージ1 パイプラインレジスタ
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            s1_a_sign <= s1_a_sign;
+            s1_a_exp  <= s1_a_exp;
+            s1_a_frac <= s1_a_frac;
+            s1_b_sign <= s1_b_sign;
+            s1_b_exp  <= s1_b_exp;
+            s1_b_frac <= s1_b_frac;
         end if;
+    end process;
 
-        -- 3. 符号付き仮数の加算または減算
-        if sign_a = sign_b then
-            sum_frac <= std_logic_vector(unsigned(aligned_frac_a) + unsigned(aligned_frac_b));
-            sign_res <= sign_a;
+    -- ステージ2 組み合わせ回路：指数の比較と仮数の整列
+    signal exp_diff        : std_logic_vector(7 downto 0);
+    signal mantissa_small  : std_logic_vector(24 downto 0);
+    signal mantissa_large  : std_logic_vector(24 downto 0);
+    signal sign_small      : std_logic;
+    signal sign_large      : std_logic;
+    signal exp_large       : std_logic_vector(7 downto 0);
+
+    exp_compare: process(s1_a_exp, s1_b_exp, s1_a_frac, s1_b_frac, s1_a_sign, s1_b_sign)
+    begin
+        if compare_vectors(s1_a_exp, s1_b_exp) = 1 then
+            exp_diff        <= subtract_vectors(s1_a_exp, s1_b_exp);
+            exp_large       <= s1_a_exp;
+            mantissa_large  <= '0' & s1_a_frac; -- 上位ビット拡張
+            mantissa_small  <= '0' & s1_b_frac;
+            sign_large      <= s1_a_sign;
+            sign_small      <= s1_b_sign;
         else
-            if unsigned(aligned_frac_a) > unsigned(aligned_frac_b) then
-                sum_frac <= std_logic_vector(unsigned(aligned_frac_a) - unsigned(aligned_frac_b));
-                sign_res <= sign_a;
+            exp_diff        <= subtract_vectors(s1_b_exp, s1_a_exp);
+            exp_large       <= s1_b_exp;
+            mantissa_large  <= '0' & s1_b_frac;
+            mantissa_small  <= '0' & s1_a_frac;
+            sign_large      <= s1_b_sign;
+            sign_small      <= s1_a_sign;
+        end if;
+    end process;
+
+    -- 仮数の整列（ビットごとのシフト）
+    signal shifted_mantissa_small : std_logic_vector(24 downto 0);
+    shift_mantissa: process(exp_diff, mantissa_small)
+        variable shift_amount : integer := 0;
+    begin
+        shift_amount := 0;
+        for i in exp_diff'range loop
+            if exp_diff(i) = '1' then
+                shift_amount := shift_amount + 2 ** (exp_diff'length - 1 - i);
+            end if;
+        end loop;
+        shifted_mantissa_small <= shift_right(mantissa_small, shift_amount);
+    end process;
+
+    -- 仮数の加算または減算（ビットごとの演算）
+    add_sub_mantissa: process(mantissa_large, shifted_mantissa_small, sign_large, sign_small)
+        variable temp_sum   : std_logic_vector(24 downto 0);
+        variable temp_diff  : std_logic_vector(24 downto 0);
+    begin
+        if sign_large = sign_small then
+            -- 加算
+            temp_sum := add_vectors(mantissa_large, shifted_mantissa_small);
+            s2_mantissa_sum <= temp_sum;
+            s2_sign_result  <= sign_large;
+            s2_exp_result   <= exp_large;
+        else
+            -- 減算
+            if compare_vectors(mantissa_large, shifted_mantissa_small) >= 0 then
+                temp_diff := subtract_vectors(mantissa_large, shifted_mantissa_small);
+                s2_mantissa_sum <= temp_diff;
+                s2_sign_result  <= sign_large;
+                s2_exp_result   <= exp_large;
             else
-                sum_frac <= std_logic_vector(unsigned(aligned_frac_b) - unsigned(aligned_frac_a));
-                sign_res <= sign_b;
+                temp_diff := subtract_vectors(shifted_mantissa_small, mantissa_large);
+                s2_mantissa_sum <= temp_diff;
+                s2_sign_result  <= sign_small;
+                s2_exp_result   <= exp_large;
             end if;
         end if;
+    end process;
 
-        -- 4. 正規化
-        if sum_frac(FRAC_WIDTH + 2) = '1' then
-            sum_frac := std_logic_vector(shift_right(unsigned(sum_frac), 1));
-            exp_res := exp_res + 1;
-        elsif sum_frac(FRAC_WIDTH + 1) = '0' then
-            while sum_frac(FRAC_WIDTH + 1) = '0' and exp_res > -BIAS loop
-                sum_frac := std_logic_vector(shift_left(unsigned(sum_frac), 1));
-                exp_res := exp_res - 1;
-            end loop;
+    -- ステージ2 パイプラインレジスタ
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            normalized_sign  <= s2_sign_result;
+            normalized_exp   <= s2_exp_result;
+            normalized_frac  <= s2_mantissa_sum(23 downto 1);
+        end if;
+    end process;
+
+    -- ステージ3 組み合わせ回路：正規化と結果のパッキング
+    normalize: process(s2_mantissa_sum, normalized_exp)
+        variable leading_one_pos : integer := -1;
+        variable adjusted_exp    : std_logic_vector(7 downto 0);
+        variable adjusted_frac   : std_logic_vector(22 downto 0);
+    begin
+        -- 先頭の1の検出
+        for i in s2_mantissa_sum'range loop
+            if s2_mantissa_sum(i) = '1' and leading_one_pos = -1 then
+                leading_one_pos := i;
+            end if;
+        end loop;
+
+        if leading_one_pos /= -1 then
+            -- 指数の調整
+            adjusted_exp := add_vectors(normalized_exp, std_logic_vector(to_unsigned(leading_one_pos - 24, 8)));
+            -- 仮数の調整
+            adjusted_frac := s2_mantissa_sum(leading_one_pos - 1 downto leading_one_pos - 23);
+        else
+            adjusted_exp := (others => '0');
+            adjusted_frac := (others => '0');
         end if;
 
-        -- 5. 結果の生成
-        result <= sign_res & std_logic_vector(to_unsigned(exp_res + BIAS, EXP_WIDTH)) & sum_frac(FRAC_WIDTH downto 1);
+        normalized_exp  <= adjusted_exp;
+        normalized_frac <= adjusted_frac;
     end process;
-end Behavioral;
 
+    -- ステージ3 パイプラインレジスタ（出力）
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            sum <= normalized_sign & normalized_exp & normalized_frac;
+        end if;
+    end process;
+
+end Behavioral;
