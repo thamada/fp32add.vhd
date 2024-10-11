@@ -122,7 +122,10 @@ begin
             reg_stage2_exp_res <= larger_exp;
             reg_stage2_frac_res <= sum_frac;
 
-            -- 正規化処理（先頭の1の位置を検出）
+            -- 正規化処理（先頭の1の位置を検出）:
+            --  whileループを使用せず、リーディング・ワン・ディテクタ（Leading One Detector） を使用して、
+            --  先頭の '1' の位置を検出します。
+            --  これにより、ループを使わずに正規化のためのシフト量を計算できます。
             if sum_frac(FRAC_WIDTH + 4) = '1' then
                 leading_one_position <= FRAC_WIDTH + 5;
             else
