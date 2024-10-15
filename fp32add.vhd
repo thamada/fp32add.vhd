@@ -79,7 +79,7 @@ begin
     return result;
 end function;
 
-entity fp32add_pipe_round is
+entity fp32add is
     Port (
         clk     : in  std_logic;                -- クロック信号
         rst     : in  std_logic;                -- リセット信号
@@ -87,9 +87,9 @@ entity fp32add_pipe_round is
         b       : in  std_logic_vector(31 downto 0); -- 32ビット入力 b
         result  : out std_logic_vector(31 downto 0)  -- 32ビット結果
     );
-end fp32add_pipe_round;
+end fp32add;
 
-architecture rtl of fp32add_pipe_round is
+architecture rtl of fp32add is
     -- 定数の定義
     constant EXP_WIDTH : integer := 8;
     constant FRAC_WIDTH : integer := 23;
